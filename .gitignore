@@ -1,0 +1,16 @@
+# data and outputs
+data/
+
+# environment
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+
+# credentials (ADC is used; never commit key files)
+*.json
+!sql/*.json
+credentials*
+*service-account*
+*.pem
+*.p12
