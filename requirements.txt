@@ -3,3 +3,4 @@ pyarrow>=26.0
 google-cloud-bigquery>=3.46
 python-dotenv>=1.2
 pytest>=9.1
+psycopg[binary]>=3.2
