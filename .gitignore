@@ -10,7 +10,7 @@ __pycache__/
 # credentials (ADC is used; never commit key files)
 *.json
 !sql/*.json
-credentials*
+*credentials*
 *service-account*
 *.pem
 *.p12

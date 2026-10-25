@@ -1,10 +1,12 @@
 # Barcelona Traffic Accidents ETL
 
 A small batch pipeline that takes five years (2021–2025) of Barcelona traffic accident
-records from Open Data BCN and turns them into a clean, typed, partitioned table in
-BigQuery.
+records from Open Data BCN and turns them into clean, typed, partitioned tables in
+**BigQuery** and in **TimescaleDB on Tiger Cloud**.
 
-**CSV → Polars (lazy) → Parquet → BigQuery**
+**CSV → Polars (lazy) → Parquet → BigQuery + TimescaleDB**
+
+The same analysis queries return identical results on both engines.
 
 ## What it does
 
@@ -25,6 +27,9 @@ BigQuery.
    - Writes Parquet partitioned by year.
    - Loads BigQuery with a single Parquet load job (`WRITE_TRUNCATE`, so reruns are idempotent).
    - The table is partitioned by `accident_date` and clustered by `nom_districte`.
+   - Loads the same Parquet data into a TimescaleDB **hypertable** on Tiger Cloud:
+     `TRUNCATE` + `COPY` in one transaction, columnstore compression, and a continuous
+     aggregate of daily totals per district. See [TimescaleDB on Tiger Cloud](#timescaledb-on-tiger-cloud).
 
 ```mermaid
 flowchart LR
@@ -34,7 +39,9 @@ flowchart LR
     C -->|failed + duplicates| E[data/quarantine/<br/>quarantine.parquet]
     D --> F[(BigQuery<br/>bcn_accidents.accidents<br/>partition: accident_date<br/>cluster: nom_districte)]
     E --> G[(BigQuery<br/>accidents_quarantine)]
-    F --> H[sql/*.sql<br/>analysis]
+    D --> T[(TimescaleDB · Tiger Cloud<br/>hypertable accidents<br/>columnstore + continuous aggregate)]
+    F --> H[sql/bigquery/*.sql]
+    T --> I[sql/timescale/*.sql<br/>+ health checks]
 ```
 
 ## Project layout
@@ -43,9 +50,12 @@ flowchart LR
 src/etl/extract.py     read CSVs, encoding/separator handling
 src/etl/transform.py   mapping, cleaning, types, dedup, quality rules, report
 src/etl/load.py        Parquet writing and BigQuery load
+src/etl/timescale.py   TimescaleDB load: schema, TRUNCATE + COPY, compression, aggregate refresh
 run.py                 runs the whole pipeline
-run_queries.py         runs sql/*.sql against BigQuery and prints results
-sql/                   analysis queries
+run_queries.py         runs sql/<engine>/*.sql and prints results
+sql/bigquery/          analysis queries for BigQuery
+sql/timescale/         schema.sql, the same analysis queries for Postgres, an EXPLAIN demo,
+                       and health_checks.sql (support runbook for psql)
 tests/                 pytest tests using small hand-made DataFrames
 ```
 
@@ -61,12 +71,20 @@ pip install -r requirements.txt
 # .env
 # GCP_PROJECT=your-project-id
 # BQ_DATASET=bcn_accidents            (dataset must already exist)
+# TIMESCALE_URL=postgres://tsdbadmin:<password>@<host>:<port>/tsdb?sslmode=require
 
-pytest                               # 20 tests, no cloud access needed
-python run.py --skip-bigquery        # local Parquet only
-python run.py                        # full pipeline incl. BigQuery load
-python run_queries.py                # run the analysis queries
+pytest                                           # 23 tests, no cloud access needed
+python run.py --skip-bigquery --skip-timescale   # local Parquet only
+python run.py                                    # full pipeline: BigQuery + TimescaleDB
+python run_queries.py                            # analysis queries on BigQuery
+python run_queries.py --engine timescale         # same queries on TimescaleDB + EXPLAIN
+psql "$TIMESCALE_URL" -f sql/timescale/health_checks.sql
 ```
+
+TimescaleDB is skipped with a message if `TIMESCALE_URL` is not set. Tiger Cloud services
+listen on a non-standard port (e.g. 32389). Some home routers, office networks and VPNs
+block it, so if the connection times out, test with
+`timeout 10 bash -c "</dev/tcp/portquiz.net/<port>" && echo OPEN`.
 
 Put the yearly CSVs in `data/raw/` (`2021_accidents_gu_bcn.csv` … `2025_accidents_gu_bcn.csv`).
 
@@ -118,16 +136,18 @@ of that.
 
 **2025 is a full year:** it covers 1 January to 31 December.
 
-## Analysis (BigQuery)
+## Analysis (BigQuery and TimescaleDB)
 
-`sql/01_accidents_by_district_per_year.sql` uses `PIVOT`. Eixample has the most accidents
+The queries in `sql/bigquery/` and `sql/timescale/` return identical numbers.
+
+`01_accidents_by_district_per_year.sql` uses `PIVOT` in BigQuery and `FILTER` in Postgres. Eixample has the most accidents
 every year (≈1,900–2,250), about twice the next district, Sant Martí.
 
-`sql/02_most_dangerous_hours.sql`: the most accidents happen at 14:00, then 13:00 and 17:00.
+`02_most_dangerous_hours.sql`: the most accidents happen at 14:00, then 13:00 and 17:00.
 Severity (serious injuries + deaths per 100 accidents) is highest in the evening:
 3.29 at 18:00 and 3.71 at 20:00.
 
-`sql/03_injuries_trend.sql`:
+`03_injuries_trend.sql`:
 
 | year | accidents | minor | serious | deaths | victims | victims YoY |
 |---|---|---|---|---|---|---|
@@ -140,9 +160,90 @@ Severity (serious injuries + deaths per 100 accidents) is highest in the evening
 Accidents are flat. Serious injuries rose about 50% from 2021 to 2024–25, while deaths
 halved after 2023.
 
-`sql/04_weekday_vs_weekend.sql`, averaged per calendar day: weekdays average 23.5
+`04_weekday_vs_weekend.sql`, averaged per calendar day: weekdays average 23.5
 accidents/day and weekends 15.4. Weekend accidents are slightly more severe (3.18 vs 2.92
 serious or fatal per 100).
+
+## TimescaleDB on Tiger Cloud
+
+The clean Parquet data is also loaded into TimescaleDB 2.31 (PostgreSQL 18) on a Tiger
+Cloud service. Schema: [sql/timescale/schema.sql](sql/timescale/schema.sql).
+
+| Feature | Choice | Why |
+|---|---|---|
+| Hypertable | partitioned by `accident_datetime`, 1-year chunks | chosen by measurement, see below |
+| Time type | `timestamptz`, loaded with session time zone `Europe/Madrid` | the source is local time; Postgres applies the right UTC offset, including DST |
+| Primary key | `(numero_expedient, accident_datetime)` | a unique constraint on a hypertable must include the partitioning column |
+| Load | `TRUNCATE` + `COPY` in one transaction | bulk load; atomic and idempotent, the Postgres equivalent of `WRITE_TRUNCATE` |
+| Compression | columnstore, `segmentby = nom_districte`, `orderby = accident_datetime DESC` | district filters jump straight to the right batches; time filters skip batches |
+| Continuous aggregate | `accidents_daily_district`: daily totals per district, bucketed in Barcelona time | queries 1, 3 and 4 read about 15k pre-computed rows instead of the raw table |
+| Policies | columnstore after 3 months; aggregate refresh daily | how it would run with live data; the loader also compresses and refreshes explicitly after a full reload |
+
+### Choosing the chunk size by measuring
+
+The first version used 1-month chunks and compressed only 1.8×. I loaded the same data into
+test hypertables with different settings and measured:
+
+| Chunk interval | segmentby | Chunks | Before | After | Ratio | Table data only |
+|---|---|---|---|---|---|---|
+| 1 month | district | 62 | 21.70 MB | 12.08 MB | 1.8× | 12.57 → 1.59 MB |
+| 1 month | none | 62 | 21.70 MB | 9.96 MB | 2.2× | 12.57 → 1.02 MB |
+| 3 months | district | 22 | 18.19 MB | 6.14 MB | 3.0× | 11.40 → 1.00 MB |
+| **1 year** | **district** | **6** | **16.79 MB** | **3.42 MB** | **4.9×** | **11.00 → 0.33 MB** |
+| 1 year | none | 6 | 16.79 MB | 3.60 MB | 4.7× | 10.99 → 0.34 MB |
+
+The data itself compresses well at every setting. What was left after compression was mostly
+**fixed overhead per chunk** (each chunk has its own indexes and catalog entries), and with
+monthly chunks each district segment held only ~60 rows. One year of this data is ~3 MB,
+far below the guideline that the most recent chunk plus its indexes should fit in about 25% of
+memory. With high-volume data the answer would be much smaller chunks.
+
+### What the query plan shows
+
+`sql/timescale/05_explain_chunk_exclusion.sql` counts one month of Eixample accidents:
+
+```
+Append
+  -> Custom Scan (VectorAgg)
+       -> Custom Scan (ColumnarScan) on _hyper_1_296_chunk
+            -> Index Scan using ..._compressed_nom_districte__ts_meta_v2... (actual rows=1)
+  -> Custom Scan (VectorAgg)
+       -> Custom Scan (ColumnarScan) on _hyper_1_297_chunk
+            ...
+Buffers: shared hit=24
+```
+
+- **Chunk exclusion:** only 2 of the 6 chunks are scanned.
+- **Segment and batch metadata:** the index on each compressed chunk uses the district and
+  the first/last timestamp of each batch, so it decompresses one batch per chunk.
+- **Vectorized:** `ColumnarScan` and `VectorAgg` aggregate compressed data in batches.
+- The whole query touches 24 buffers (about 200 KB).
+
+### Things I learned (and would watch for on a support ticket)
+
+- **Chunk intervals are fixed widths, not calendar periods.** `INTERVAL '1 month'` became 30
+  days and `INTERVAL '1 year'` became 360 days, aligned to a fixed origin. That's why one month
+  of 2024 spans two chunks (a boundary falls on 18 March).
+- **`TRUNCATE` does mark the continuous aggregate out of date.** I tested it by reloading
+  different data into a test hypertable: after `refresh_continuous_aggregate(..., NULL, NULL)`,
+  the aggregate matched the new data.
+- **Session time zone matters.** The server runs in UTC. Daily buckets start at Barcelona
+  midnight (22:00/23:00 UTC), so the queries use `AT TIME ZONE 'Europe/Madrid'` to get the
+  right year in any session.
+- **NULL ordering differs between engines.** Postgres puts NULLs first in `DESC` order and
+  BigQuery puts them last; also `sum()` over no rows is NULL. Fixed with `coalesce(..., 0)`.
+- **Connection pooling and session settings.** The loader relies on `SET TIME ZONE`, which a
+  pooler in transaction mode does not keep between statements, so it uses a direct connection.
+- **Network.** The first connection attempt timed out. DNS resolved, but the port was blocked
+  for *any* server (tested against portquiz.net), so the cause was the local network, not the
+  database. Switching networks fixed it.
+
+### Health checks
+
+[sql/timescale/health_checks.sql](sql/timescale/health_checks.sql) is what I'd run first on a
+ticket about a service: versions, hypertables and chunk interval, chunk ranges and
+compression state, size (table / indexes / TOAST), compression savings, background job
+status and failures, and how far the continuous aggregate is materialized.
 
 ## Design choices
 
@@ -160,7 +261,7 @@ serious or fatal per 100).
   row loses the second cause for 19 accidents. Those rows are still in quarantine. A
   separate `accident_causes` table would keep them if needed.
 
-## Polars vs Spark, BigQuery vs Databricks
+## Polars vs Spark, BigQuery vs Databricks vs TimescaleDB
 
 **Polars vs Spark**
 - **Polars** runs on one machine, is fast (Rust, multi-threaded, columnar) and needs no
@@ -181,6 +282,18 @@ serious or fatal per 100).
   the same data, and teams who want open table formats and multi-cloud.
 - Rule of thumb: mostly SQL analytics on GCP → BigQuery. Mostly code-heavy data
   engineering or ML, or an existing Spark / Delta estate → Databricks.
+
+**BigQuery vs TimescaleDB (Tiger Cloud)**
+- **BigQuery** is built for large analytical scans over batch-loaded data. It costs nothing
+  when idle and scales to petabytes, but it isn't an application database: no fast single-row
+  reads and writes, and per-query latency is typically seconds.
+- **TimescaleDB** is PostgreSQL. The same database handles transactions (fast inserts,
+  updates, constraints, joins with normal tables) and real-time analytics on time-series data
+  through hypertables, columnstore compression and continuous aggregates. Queries return in
+  milliseconds, and any Postgres tool, driver or extension works.
+- Rule of thumb: an application that writes events continuously and needs live dashboards or
+  low-latency queries on recent data → TimescaleDB. Large batch analytics over many sources,
+  with no application writing to it → BigQuery. Many teams use both, as this project does.
 
 ## Data source
 
